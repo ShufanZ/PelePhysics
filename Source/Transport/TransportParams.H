@@ -83,6 +83,12 @@ struct TransParm<eos::SRK, SimpleTransport>
   amrex::GpuArray<amrex::Real, NUM_SPECIES> dip = {0.0};
   amrex::GpuArray<amrex::Real, NUM_SPECIES> pol = {0.0};
   amrex::GpuArray<amrex::Real, NUM_SPECIES> zrot = {0.0};
+  
+  //Hotfix: to address absurd viscosity
+  amrex::GpuArray<amrex::Real, NUM_SPECIES> sig_chung = {0.0};
+  amrex::GpuArray<amrex::Real, NUM_SPECIES> eps_chung = {0.0};
+  amrex::GpuArray<amrex::Real, NUM_SPECIES * NUM_SPECIES> sqrtT2ij_chung = {0.0};
+  amrex::GpuArray<amrex::Real, NUM_SPECIES * NUM_SPECIES> sqrtEpsilonij_chung = {0.0};
 
   amrex::GpuArray<amrex::Real, NUM_SPECIES * NUM_FIT> fitmu = {0.0};
   amrex::GpuArray<amrex::Real, NUM_SPECIES * NUM_FIT> fitlam = {0.0};
@@ -433,6 +439,30 @@ struct InitParm<transport::TransParm<eos::SRK, transport::SimpleTransport>>
                S_ij * S_ij * S_ij);
           }
         }
+      }
+    }
+    //Implementation: use Pc, Tc to evaluate sigma & 
+    // epsilon/k in chung's correction formulation.
+    const amrex::Real Rcst = 83.144598; // bar·cm^3/(mol·K) consistent to CEPTR
+    const amrex::Real Zc_def = 0.291;   //  default  
+    amrex::Real Tci[NUM_SPECIES], ai[NUM_SPECIES], bi[NUM_SPECIES];
+    GET_CRITPARAMS(Tci, ai, bi, tparm->omega.data());
+    for (int i = 0; i < NUM_SPECIES; ++i) {
+      //bi to Pc [bar]（consistent to NIST）
+      const amrex::Real Pci =
+        0.08664 * Rcst * Tci[i] / (tparm->wt[i] * bi[i]);
+      const amrex::Real Vci = Zc_def * Rcst * Tci[i] / Pci; // cm^3/mol
+      // Cantera Chung：σ[Å]=0.809·Vc^(1/3)，ε/k[K]=Tc/1.2593
+      tparm->sig_chung[i] = 0.809 * std::cbrt(Vci);
+      tparm->eps_chung[i] = Tci[i] / 1.2593;
+    }
+    for (int i = 0; i < NUM_SPECIES; ++i) {
+      for (int j = 0; j < NUM_SPECIES; ++j) {
+        const int idx = i * NUM_SPECIES + j;
+        tparm->sqrtT2ij_chung[idx] =
+          std::sqrt(tparm->sig_chung[i] * tparm->sig_chung[j]);
+        tparm->sqrtEpsilonij_chung[idx] =
+          std::sqrt(tparm->eps_chung[i] * tparm->eps_chung[j]);
       }
     }
   }

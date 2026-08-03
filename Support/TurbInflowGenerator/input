@@ -1,5 +1,5 @@
 type = turb_box
-hit_file = hit_ic_2_64.dat
-input_ncell = 64
+hit_file = hit_ic_4_128.dat
+input_ncell = 128
 urms0 = 1.0
 ofile = TurbTEST

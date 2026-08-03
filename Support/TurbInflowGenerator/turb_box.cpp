@@ -172,6 +172,12 @@ turbinflow_from_turb_box(std::ofstream& ifsd, std::ofstream& ifsh)
         const IntVect idx_plt =
           index_mapper(idx_plane, dim_map, box_turb, {1, 1, 1});
         planearr(idx_plane) = fab(idx_plt, dim_map[d]);
+        amrex::Print() <<std::endl;
+        amrex::Print() <<std::endl;
+        amrex::Print() <<"Plane index = "<<std::endl;
+      amrex::Print()<<idx_plane.vect[0]<<","<<idx_plane.vect[1]<<","<<idx_plane.vect[2]<<std::endl;
+      amrex::Print() <<"Plt index = "<<std::endl;
+      amrex::Print()<<idx_plt.vect[0]<<","<<idx_plt.vect[1]<<","<<idx_plt.vect[2]<<std::endl;
       });
       ifsh << ifsd.tellp() << std::endl;
       TMP.writeOn(ifsd);

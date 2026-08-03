@@ -45,12 +45,12 @@ struct NonIdealChungCorrections<eos::SRK>
         const amrex::Real Xij = Xloc[i] * Xloc[j];
         const int idx = i * NUM_SPECIES + j;
 
-        const amrex::Real sqrtT2 = trans_parm->sqrtT2ij[idx];
+        const amrex::Real sqrtT2 = trans_parm->sqrtT2ij_chung[idx];
         const amrex::Real T2 = sqrtT2 * sqrtT2;
         const amrex::Real T3 = T2 * sqrtT2;
         sigma_M_3 += Xij * T3;
 
-        const amrex::Real Epsilon_ij = trans_parm->sqrtEpsilonij[idx];
+        const amrex::Real Epsilon_ij = trans_parm->sqrtEpsilonij_chung[idx];
         Epsilon_M += Xij * Epsilon_ij * T3;
 
         const amrex::Real Omega_ij =
@@ -59,13 +59,16 @@ struct NonIdealChungCorrections<eos::SRK>
 
         MW_m += Xij * Epsilon_ij * T2 * trans_parm->sqrtMWij[idx];
 
-        DP_m_4 += Xij * trans_parm->dip[i] * trans_parm->dip[i] *
-                  trans_parm->dip[j] * trans_parm->dip[j] / (T3 * Epsilon_ij);
+        //This equation seems problematic compared to cantera
+        //DP_m_4 += Xij * trans_parm->dip[i] * trans_parm->dip[i] *
+        //          trans_parm->dip[j] * trans_parm->dip[j] / (T3 * E psilon_ij);
+        DP_m_4 +=Xij * trans_parm->dip[i] * trans_parm->dip[i] *
+                  trans_parm->dip[j] * trans_parm->dip[j] /T3;
 
         KappaM += Xij * trans_parm->sqrtKappaij[idx];
       }
     }
-
+    
     MW_m *= MW_m;
     const amrex::Real sigma_M = std::cbrt(sigma_M_3);
     const amrex::Real InvSigma1 = 1.0 / sigma_M;
@@ -75,10 +78,15 @@ struct NonIdealChungCorrections<eos::SRK>
     const amrex::Real Tcm = 1.2593 * Epsilon_M;
     const amrex::Real Vcm = 1.8887 * sigma_M_3;
     Omega_M *= InvSigma3;
-    MW_m = MW_m * InvSigma3 * InvSigma1 / (Epsilon_M * Epsilon_M);
-    DP_m_4 = DP_m_4 * sigma_M_3 * Epsilon_M;
-    const amrex::Real DP_red_4 =
-      297.2069113e6 * DP_m_4 / (Vcm * Vcm * Tcm * Tcm);
+    MW_m = MW_m * InvSigma3 * InvSigma1 / (Epsilon_M * Epsilon_M); //Is this correct? Looks suspicious
+    //DP_m_4 = DP_m_4 * sigma_M_3 * Epsilon_M;
+    DP_m_4 = DP_m_4 * sigma_M_3;
+    //const amrex::Real DP_red_4 =
+    //  297.2069113e6 * DP_m_4 / (Vcm * Vcm * Tcm * Tcm);
+    const amrex::Real DP_red_4 = pow(131.3,4)* DP_m_4 / (Vcm * Vcm * Tcm * Tcm);
+    //amrex::Print()<<"MW_mean = "<<MW_m<<std::endl;
+    //amrex::Print()<<"MW_frominput = "<<wbar<<std::endl;
+    //amrex::Print()<<"rholoc = "<<rholoc <<std::endl; 
     const amrex::Real y = Vcm * rholoc / (6.0 * wbar);
     const amrex::Real G1 =
       (1.0 - 0.5 * y) / ((1.0 - y) * (1.0 - y) * (1.0 - y));
@@ -91,6 +99,10 @@ struct NonIdealChungCorrections<eos::SRK>
                trans_parm->Afac[4 * i + 2] * DP_red_4 +
                trans_parm->Afac[4 * i + 3] * KappaM;
       }
+      amrex::Print()<<"omegam = "<<Omega_M<<std::endl;
+      amrex::Print()<<"mur^4 = "<<DP_red_4<<std::endl;
+      amrex::Print()<<"KappaM = "<<KappaM<<std::endl;
+      amrex::Print()<<"Vcm = "<<Vcm<<std::endl;
       const amrex::Real G2 = (A[0] * (1.0 - std::exp(-A[3] * y)) / y +
                               A[1] * G1 * std::exp(A[4] * y) + A[2] * G1) /
                              (A[0] * A[3] + A[1] + A[2]);
@@ -98,6 +110,19 @@ struct NonIdealChungCorrections<eos::SRK>
         (36.344e-6 * std::sqrt(MW_m * Tcm) / std::pow(Vcm, 2.0 / 3.0)) * A[6] *
         y * y * G2 * std::exp(A[7] + A[8] / Tstar + A[9] / (Tstar * Tstar));
 
+      amrex::Print()<<"mu0 = "<<mu<<std::endl;
+      for(int ixz = 0; ixz<10;ixz++)
+      {
+        amrex::Print()<<"A["<<ixz+1<<"]="<<A[ixz]<<std::endl;
+      }
+      amrex::Print()<<"mult = "<<(1.0 / G2 + A[5] * y)<<std::endl;
+      amrex::Print()<<"G2 = "<<G2<<std::endl;
+      amrex::Print()<<"y = "<<y<<std::endl;
+      amrex::Print()<<"etak = "<<mu * (1.0 / G2 + A[5] * y)<<std::endl;
+
+      amrex::Print()<<"etap = "<<(36.344e-6 * std::sqrt(MW_m * Tcm) / std::pow(Vcm, 2.0 / 3.0)) * A[6] *
+        y * y * G2 * std::exp(A[7] + A[8] / Tstar + A[9] / (Tstar * Tstar))<<std::endl;
+      
       const amrex::Real updated_mu = mu * (1.0 / G2 + A[5] * y) + eta_P;
       if (updated_mu > 0) {
         mu = updated_mu;
