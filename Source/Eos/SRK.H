@@ -500,17 +500,7 @@ struct SRK
     amrex::Error("HY2T not physically possible for this EoS");
   }
 
-  AMREX_GPU_HOST_DEVICE
-  AMREX_FORCE_INLINE
-  static void RHY2T(
-    const amrex::Real /*R*/,
-    const amrex::Real /*H*/,
-    const amrex::Real* /*Y[]*/,
-    amrex::Real& /*T*/)
-  {
-    // RHY2T is possible but is not yet supported
-    amrex::Error("RHY2T not yet supported for this EoS");
-  }
+  // RHY2T is implemented below, next to the other Newton inversions.
 
   AMREX_GPU_HOST_DEVICE
   AMREX_FORCE_INLINE
@@ -1108,6 +1098,80 @@ struct SRK
     }
   }
 
+  // Same Helmholtz linearization as RTY2transport, with four residual-Jacobian
+  // corrections relative to a^r = -Rm T ln(1-bm/tau) - am K1:
+  //   1. diP attractive prefactor Y/(Rm T), not Y*Wbar/(Rm T)
+  //   2. diP attractive last pole 1/(tau+bm)^2, not 1/(tau-bm)^2
+  //   3. dijY covolume cross term sign is minus
+  //   4. (K1-Inv3)*dAmdY[ii]*Bi[jj]/bm, not the j-independent
+  //      (K1*dAmdY[ii]-Inv3)*Bi[ii]/bm
+  AMREX_GPU_HOST_DEVICE
+  AMREX_FORCE_INLINE
+  void RTY2transport2(
+    const amrex::Real R,
+    const amrex::Real T,
+    const amrex::Real Y[NUM_SPECIES],
+    amrex::Real diP[NUM_SPECIES],
+    amrex::Real dijY[NUM_SPECIES][NUM_SPECIES])
+  {
+    amrex::Real bm, am, dAmdY[NUM_SPECIES], d2AmdY2[NUM_SPECIES][NUM_SPECIES];
+    amrex::Real wbar = 0.0;
+    amrex::Real dpdtau, dpdYk[NUM_SPECIES];
+
+    CKMMWY(Y, wbar);
+    MixingRuleAmBm(T, Y, am, bm);
+    Calc_dAmdY(T, Y, dAmdY);
+    Calc_d2AmdY2(T, Y, d2AmdY2);
+
+    amrex::Real tau = 1.0 / R;
+    amrex::Real InvBm = 1.0 / bm;
+    amrex::Real K1 = (1.0 / bm) * log1p(bm * R);
+    amrex::Real InvEosT1Denom = 1.0 / (tau - bm);
+    amrex::Real InvEosT2Denom = 1.0 / (tau * (tau + bm));
+    amrex::Real InvEosT3Denom = 1.0 / (tau + bm);
+    amrex::Real Rm = Constants::RU / wbar;
+
+    dpdtau = -Rm * T * InvEosT1Denom * InvEosT1Denom +
+             am * (2.0 * tau + bm) * InvEosT2Denom * InvEosT2Denom;
+
+    for (int ii = 0; ii < NUM_SPECIES; ii++) {
+      amrex::Real Rmk = Constants::RU * imw(ii);
+      dpdYk[ii] = Rmk * T * InvEosT1Denom - dAmdY[ii] * InvEosT2Denom +
+                  Bi[ii] * (Rm * T * InvEosT1Denom * InvEosT1Denom +
+                            am * InvEosT2Denom * InvEosT3Denom);
+    }
+
+    for (int ii = 0; ii < NUM_SPECIES; ii++) {
+
+      diP[ii] = (Y[ii] / (Rm * T) *
+                 ((dAmdY[ii] - am * Bi[ii] * InvBm) * InvEosT2Denom +
+                  am * Bi[ii] * InvBm * InvEosT3Denom * InvEosT3Denom)) -
+                Y[ii] * (Bi[ii] * InvEosT1Denom * InvEosT1Denom +
+                         wbar * imw(ii) * InvEosT1Denom);
+      diP[ii] /= dpdtau;
+
+      for (int jj = 0; jj < NUM_SPECIES; jj++) {
+        dijY[ii][jj] = 0.0;
+      }
+      dijY[ii][ii] = wbar * imw(ii);
+      for (int jj = 0; jj < NUM_SPECIES; jj++) {
+        dijY[ii][jj] +=
+          -diP[ii] * dpdYk[jj] -
+          wbar * Y[ii] * InvEosT1Denom * (Bi[ii] * imw(jj) + Bi[jj] * imw(ii)) +
+          Y[ii] * InvEosT1Denom * InvEosT1Denom * Bi[ii] * Bi[jj] +
+          Y[ii] / (Rm * T) *
+            ((K1 - InvEosT3Denom) * dAmdY[jj] * Bi[ii] * InvBm -
+             K1 * d2AmdY2[ii][jj] +
+             (K1 - InvEosT3Denom) * dAmdY[ii] * Bi[jj] * InvBm +
+             ((-2.0 * am * K1 + am * InvEosT3Denom) * Bi[ii] * Bi[jj] * InvBm *
+              InvBm) +
+             ((am * InvEosT3Denom * InvBm +
+               am * InvEosT3Denom * InvEosT3Denom) *
+              Bi[ii] * Bi[jj] * InvBm));
+      }
+    }
+  }
+
   template <class... Args>
   AMREX_GPU_HOST_DEVICE explicit SRK(Args... /*unused*/)
   {
@@ -1123,6 +1187,560 @@ struct SRK
   amrex::Real sqrtOneOverTc[NUM_SPECIES];
   amrex::Real sqrtAsti[NUM_SPECIES];
   amrex::Real Fomega[NUM_SPECIES];
+  
+  
+  
+  //iterative algorithm to compute T
+  void RHY2T(
+    const amrex::Real R,
+    const amrex::Real H,
+    const amrex::Real Y[NUM_SPECIES],
+    amrex::Real& T)
+  {
+    // T on entry is the initial guess and is overwritten on return.
+    amrex::Real Tn = T;
+    AMREX_ASSERT(Tn > 0.0);
+    amrex::Real dT = 100000.0;
+    int nIter = 0;
+    while (std::abs(dT) > convCritT && nIter < maxIter) {
+      ++nIter;
+      amrex::Real h = 0.0;
+      RTY2H(R, Tn, Y, h);
+      const amrex::Real dhdt = Calc_dhmdT(R, Tn, Y);
+      dT = (h - H) / dhdt;
+      Tn -= dT;
+    }
+    T = Tn;
+    AMREX_ASSERT(nIter < maxIter);
+  }
+
+
+
+
+  //------------------------------------------------------------------
+  // Analytical derivatives for low mach supports
+  // Self-contained interface: state in (R, T, Y),
+  //Formulas identical to RTY2Cp / RTY2Hi.
+  //------------------------------------------------------------------
+
+  // (dp/dT)_{rho,Y}
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real Calc_dpdT(
+    const amrex::Real R, const amrex::Real T, const amrex::Real Y[NUM_SPECIES])
+  {
+    amrex::Real wbar = 0.0;
+    CKMMWY(Y, wbar);
+    amrex::Real bm = 0.0;
+    MixingRuleBm(Y, bm);
+    amrex::Real dAmdT = 0.0;
+    Calc_dAmdT(T, Y, dAmdT);
+    const amrex::Real tau = 1.0 / R;
+    const amrex::Real Rm = Constants::RU / wbar;
+    return Rm / (tau - bm) - dAmdT / (tau * (tau + bm));
+  }
+
+  // (dp/drho)_{T,Y} = -tau^2 * (dp/dtau)_{T,Y}
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real Calc_dpdrho(
+    const amrex::Real R, const amrex::Real T, const amrex::Real Y[NUM_SPECIES])
+  {
+    amrex::Real wbar = 0.0;
+    CKMMWY(Y, wbar);
+    amrex::Real am = 0.0;
+    amrex::Real bm = 0.0;
+    MixingRuleAmBm(T, Y, am, bm);
+    const amrex::Real tau = 1.0 / R;
+    const amrex::Real Rm = Constants::RU / wbar;
+    const amrex::Real InvEosT1Denom = 1.0 / (tau - bm);
+    const amrex::Real InvEosT2Denom = 1.0 / (tau * (tau + bm));
+    const amrex::Real dpdtau =
+      -Rm * T * InvEosT1Denom * InvEosT1Denom +
+      am * (2.0 * tau + bm) * InvEosT2Denom * InvEosT2Denom;
+    return -tau * tau * dpdtau;
+  }
+
+  // (dh/dT)_{rho,Y}
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real Calc_dhmdT(
+    const amrex::Real R, const amrex::Real T, const amrex::Real Y[NUM_SPECIES])
+  {
+    amrex::Real wbar = 0.0;
+    CKMMWY(Y, wbar);
+    amrex::Real bm = 0.0;
+    MixingRuleBm(Y, bm);
+    amrex::Real am = 0.0;
+    amrex::Real dAmdT = 0.0;
+    amrex::Real d2AmdT2 = 0.0;
+    Calc_Am_and_derivs(T, Y, am, dAmdT, d2AmdT2);
+    amrex::Real Cpig = 0.0;
+    CKCPBS(T, Y, Cpig);
+    const amrex::Real tau = 1.0 / R;
+    const amrex::Real K1 = (1.0 / bm) * log1p(bm * R);
+    const amrex::Real Rm = Constants::RU / wbar;
+    return Cpig + T * d2AmdT2 * K1 - dAmdT / (tau + bm) +
+           Rm * bm / (tau - bm);
+  }
+
+  // (dh/drho)_{T,Y} = -tau^2 * (dh/dtau)_{T,Y}
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real Calc_dhmdrho(
+    const amrex::Real R, const amrex::Real T, const amrex::Real Y[NUM_SPECIES])
+  {
+    amrex::Real wbar = 0.0;
+    CKMMWY(Y, wbar);
+    amrex::Real am = 0.0;
+    amrex::Real bm = 0.0;
+    MixingRuleAmBm(T, Y, am, bm);
+    amrex::Real dAmdT = 0.0;
+    Calc_dAmdT(T, Y, dAmdT);
+    const amrex::Real tau = 1.0 / R;
+    const amrex::Real Rm = Constants::RU / wbar;
+    const amrex::Real InvEosT1Denom = 1.0 / (tau - bm);
+    const amrex::Real InvEosT2Denom = 1.0 / (tau * (tau + bm));
+    const amrex::Real InvEosT3Denom = 1.0 / (tau + bm);
+    const amrex::Real dhmdtau =
+      -(T * dAmdT - am) * InvEosT2Denom +
+      am * InvEosT3Denom * InvEosT3Denom -
+      Rm * T * bm * InvEosT1Denom * InvEosT1Denom;
+    return -tau * tau * dhmdtau;
+  }
+
+  // (dp/dY_k)_{rho,T,Y_{j!=k}} — all species
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE void Calc_dpdY(
+    const amrex::Real R,
+    const amrex::Real T,
+    const amrex::Real Y[NUM_SPECIES],
+    amrex::Real dPdY[NUM_SPECIES])
+  {
+    amrex::Real wbar = 0.0;
+    CKMMWY(Y, wbar);
+    amrex::Real am = 0.0;
+    amrex::Real bm = 0.0;
+    MixingRuleAmBm(T, Y, am, bm);
+    amrex::Real dAmdY[NUM_SPECIES];
+    Calc_dAmdY(T, Y, dAmdY);
+    const amrex::Real tau = 1.0 / R;
+    const amrex::Real Rm = Constants::RU / wbar;
+    const amrex::Real InvEosT1Denom = 1.0 / (tau - bm);
+    const amrex::Real InvEosT2Denom = 1.0 / (tau * (tau + bm));
+    const amrex::Real InvEosT3Denom = 1.0 / (tau + bm);
+    for (int k = 0; k < NUM_SPECIES; ++k) {
+      const amrex::Real Rmk = Constants::RU * imw(k);
+      dPdY[k] = Rmk * T * InvEosT1Denom - dAmdY[k] * InvEosT2Denom +
+                Bi[k] * (Rm * T * InvEosT1Denom * InvEosT1Denom +
+                         am * InvEosT2Denom * InvEosT3Denom);
+    }
+  }
+
+  // (dh/dY_k)_{rho,T,Y_{j!=k}} — all species
+  // Note: xi_k = (dh/dY_k)_{p,T} =
+  //   Calc_dhmdY(R,T,Y,...)[k]
+  //   - (Calc_dhmdrho(R,T,Y) / Calc_dpdrho(R,T,Y)) * Calc_dpdY(R,T,Y,...)[k]
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE void Calc_dhmdY(
+    const amrex::Real R,
+    const amrex::Real T,
+    const amrex::Real Y[NUM_SPECIES],
+    amrex::Real dhdY[NUM_SPECIES])
+  {
+    amrex::Real wbar = 0.0;
+    CKMMWY(Y, wbar);
+    amrex::Real am = 0.0;
+    amrex::Real bm = 0.0;
+    MixingRuleAmBm(T, Y, am, bm);
+    amrex::Real dAmdT = 0.0;
+    Calc_dAmdT(T, Y, dAmdT);
+    amrex::Real dAmdY[NUM_SPECIES];
+    Calc_dAmdY(T, Y, dAmdY);
+    amrex::Real d2AmdTY[NUM_SPECIES];
+    Calc_d2AmdTY(T, Y, d2AmdTY);
+    amrex::Real hig[NUM_SPECIES];
+    CKHMS(T, hig);
+    const amrex::Real tau = 1.0 / R;
+    const amrex::Real K1 = (1.0 / bm) * log1p(bm * R);
+    const amrex::Real Rm = Constants::RU / wbar;
+    const amrex::Real InvEosT1Denom = 1.0 / (tau - bm);
+    const amrex::Real InvEosT2Denom = 1.0 / (tau * (tau + bm));
+    const amrex::Real InvEosT3Denom = 1.0 / (tau + bm);
+    for (int k = 0; k < NUM_SPECIES; ++k) {
+      const amrex::Real Rmk = Constants::RU * imw(k);
+      dhdY[k] = hig[k] + (T * d2AmdTY[k] - dAmdY[k]) * K1 -
+                Bi[k] * (T * dAmdT - am) * (K1 / bm - InvEosT3Denom / bm) +
+                am * Bi[k] * InvEosT3Denom * InvEosT3Denom -
+                InvEosT3Denom * dAmdY[k] + Rmk * T * bm * InvEosT1Denom +
+                Rm * T * Bi[k] *
+                  (InvEosT1Denom + bm * InvEosT1Denom * InvEosT1Denom);
+    }
+  }
+
+  // xi_k = (dh/dY_k)_{p,T,Y_{j!=k}} — all species, analytic.
+  // Assembled from the single-derivative functions above:
+  //   xi_k = dhmdY[k] - (dhmdrho / dpdrho) * dpdY[k]
+  // (the -tau^2 chain factors cancel in the ratio; note dhmdrho/dpdrho
+  // equals dhmdtau/dpdtau). Intermediates are intentionally recomputed
+  // per call for modularity — this is a verification path, not a hot
+  // path. Cross-checked by Calc_xi_pT_num below.
+  /*AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE void Calc_xi_pT(
+    const amrex::Real R,
+    const amrex::Real T,
+    const amrex::Real Y[NUM_SPECIES],
+    amrex::Real xi[NUM_SPECIES])
+  {
+    amrex::Real dpdY[NUM_SPECIES];
+    Calc_dhmdY(R, T, Y, xi);
+    Calc_dpdY(R, T, Y, dpdY);
+    const amrex::Real ratio = Calc_dhmdrho(R, T, Y) / Calc_dpdrho(R, T, Y);
+    for (int k = 0; k < NUM_SPECIES; ++k) {
+      xi[k] -= ratio * dpdY[k];
+    }
+  }*/
+
+  // Sandler/Reid ln(phi_k) at (rho, T, Y), k_ij = 0. Units CGS.
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE void RTY2lnphi(
+    const amrex::Real R,
+    const amrex::Real T,
+    const amrex::Real Y[NUM_SPECIES],
+    amrex::Real lnphi[NUM_SPECIES])
+  {
+    amrex::Real am = 0.0;
+    amrex::Real bm = 0.0;
+    amrex::Real wbar = 0.0;
+    amrex::Real P = 0.0;
+    MixingRuleAmBm(T, Y, am, bm);
+    CKMMWY(Y, wbar);
+    RTY2P(R, T, Y, P);
+
+    const amrex::Real RT = Constants::RU * T;
+    const amrex::Real A = am * wbar * wbar * P / (RT * RT);
+    const amrex::Real B = bm * wbar * P / RT;
+    const amrex::Real Z = P * wbar / (R * RT);
+
+    amrex::Real mw[NUM_SPECIES];
+    molecular_weight(mw);
+    const amrex::Real sqrtT = std::sqrt(T);
+    amrex::Real amloc[NUM_SPECIES];
+    amrex::Real YdotA = 0.0;
+    for (int i = 0; i < NUM_SPECIES; ++i) {
+      amloc[i] =
+        (1.0 + Fomega[i] * (1.0 - sqrtT * sqrtOneOverTc[i])) * sqrtAsti[i];
+      YdotA += Y[i] * amloc[i];
+    }
+
+    for (int k = 0; k < NUM_SPECIES; ++k) {
+      const amrex::Real beta = (Bi[k] * mw[k]) / (bm * wbar);
+      const amrex::Real two =
+        2.0 * amloc[k] * mw[k] * YdotA / (am * wbar);
+      lnphi[k] = (Z - 1.0) * beta - std::log(Z - B) -
+                 (A / B) * (two - beta) * std::log1p(B / Z);
+    }
+  }
+
+  // Contracted differential of Sandler/Reid ln(phi) at frozen T.
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE static amrex::Real dlnphi_from_diffs(
+    const amrex::Real Z,
+    const amrex::Real Bterm,
+    const amrex::Real A,
+    const amrex::Real Q,
+    const amrex::Real L,
+    const amrex::Real beta,
+    const amrex::Real psi,
+    const amrex::Real dZ,
+    const amrex::Real dB,
+    const amrex::Real dA,
+    const amrex::Real dbeta,
+    const amrex::Real dpsi)
+  {
+    const amrex::Real dQ = (Bterm * dA - A * dB) / (Bterm * Bterm);
+    const amrex::Real dL = (Z * dB - Bterm * dZ) / (Z * (Z + Bterm));
+    return beta * dZ + (Z - 1.0) * dbeta - (dZ - dB) / (Z - Bterm) -
+           psi * L * dQ - Q * L * dpsi - Q * psi * dL;
+  }
+
+  // D_ij = (d ln phi_i / d Y_j)_{T,p}, Y_j unconstrained (other Y fixed,
+  // density re-solved to hold p). Chain rule from the (rho,T,Y) slices
+  // of RTY2lnphi. Not RTY2transport's dijY.
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE void RTY2dlnphidY(
+    const amrex::Real R,
+    const amrex::Real T,
+    const amrex::Real Y[NUM_SPECIES],
+    amrex::Real D[NUM_SPECIES][NUM_SPECIES])
+  {
+    for (int i = 0; i < NUM_SPECIES; ++i) {
+      for (int j = 0; j < NUM_SPECIES; ++j) {
+        D[i][j] = 0.0;
+      }
+    }
+
+    amrex::Real am = 0.0;
+    amrex::Real bm = 0.0;
+    amrex::Real wbar = 0.0;
+    amrex::Real P = 0.0;
+    MixingRuleAmBm(T, Y, am, bm);
+    CKMMWY(Y, wbar);
+    RTY2P(R, T, Y, P);
+
+    const amrex::Real RT = Constants::RU * T;
+    const amrex::Real A = am * wbar * wbar * P / (RT * RT);
+    const amrex::Real Bterm = bm * wbar * P / RT;
+    const amrex::Real Z = P * wbar / (R * RT);
+    if (Bterm <= 0.0 || Z <= Bterm || am <= 0.0) {
+      return;
+    }
+
+    const amrex::Real Q = A / Bterm;
+    const amrex::Real L = std::log1p(Bterm / Z);
+
+    amrex::Real mw[NUM_SPECIES];
+    molecular_weight(mw);
+    const amrex::Real sqrtT = std::sqrt(T);
+    amrex::Real amloc[NUM_SPECIES];
+    amrex::Real YdotA = 0.0;
+    for (int i = 0; i < NUM_SPECIES; ++i) {
+      amloc[i] =
+        (1.0 + Fomega[i] * (1.0 - sqrtT * sqrtOneOverTc[i])) * sqrtAsti[i];
+      YdotA += Y[i] * amloc[i];
+    }
+    if (YdotA <= 0.0) {
+      return;
+    }
+
+    amrex::Real dAmdY[NUM_SPECIES];
+    amrex::Real dPdY[NUM_SPECIES];
+    Calc_dAmdY(T, Y, dAmdY);
+    Calc_dpdY(R, T, Y, dPdY);
+    const amrex::Real dPdrho = Calc_dpdrho(R, T, Y);
+
+    amrex::Real beta[NUM_SPECIES];
+    amrex::Real two[NUM_SPECIES];
+    amrex::Real psi[NUM_SPECIES];
+    for (int k = 0; k < NUM_SPECIES; ++k) {
+      beta[k] = (Bi[k] * mw[k]) / (bm * wbar);
+      two[k] = 2.0 * amloc[k] * mw[k] * YdotA / (am * wbar);
+      psi[k] = two[k] - beta[k];
+    }
+
+    // (d ln phi_k / d rho)_{T,Y}: beta, psi frozen.
+    const amrex::Real Z_rho = Z * (dPdrho / P - 1.0 / R);
+    const amrex::Real A_rho = A * dPdrho / P;
+    const amrex::Real B_rho = Bterm * dPdrho / P;
+    amrex::Real dlnphi_drho[NUM_SPECIES];
+    for (int k = 0; k < NUM_SPECIES; ++k) {
+      dlnphi_drho[k] = dlnphi_from_diffs(
+        Z, Bterm, A, Q, L, beta[k], psi[k], Z_rho, B_rho, A_rho, 0.0, 0.0);
+    }
+
+    // (d ln phi_k / d Y_j)_{rho,T} then lift to const p.
+    for (int j = 0; j < NUM_SPECIES; ++j) {
+      const amrex::Real wbar_Y = -wbar * wbar * imw(j);
+      const amrex::Real bm_Y = Bi[j];
+      const amrex::Real am_Y = dAmdY[j];
+      const amrex::Real P_Y = dPdY[j];
+      const amrex::Real rho_Y = -P_Y / dPdrho;
+
+      const amrex::Real Z_Y = (P_Y * wbar + P * wbar_Y) / (R * RT);
+      const amrex::Real A_Y =
+        (am_Y * wbar * wbar * P + am * 2.0 * wbar * wbar_Y * P +
+         am * wbar * wbar * P_Y) /
+        (RT * RT);
+      const amrex::Real B_Y =
+        (bm_Y * wbar * P + bm * wbar_Y * P + bm * wbar * P_Y) / RT;
+
+      for (int k = 0; k < NUM_SPECIES; ++k) {
+        const amrex::Real beta_Y =
+          -beta[k] * (bm_Y / bm + wbar_Y / wbar);
+        const amrex::Real two_Y =
+          two[k] * (-amloc[j] / YdotA + wbar * imw(j));
+        const amrex::Real psi_Y = two_Y - beta_Y;
+        const amrex::Real dlnphi_dY_rho = dlnphi_from_diffs(
+          Z, Bterm, A, Q, L, beta[k], psi[k], Z_Y, B_Y, A_Y, beta_Y, psi_Y);
+        D[k][j] = dlnphi_dY_rho + dlnphi_drho[k] * rho_Y;
+      }
+    }
+  }
+
+  //------------------------------------------------------------------
+  // [Derivatives sandbox] Numerical (central-difference) counterparts
+  // of the Calc_* partials above, for validation purposes.
+  // Step policy: fd_kRel * max(|x|, floor), floors: T 1 K,
+  // rho 1e-8 g/cm^3, Y 1e-3. Y kicks are unconstrained
+  // (other Y_j fixed, no renormalization) — same convention as
+  // SRKNumericDeriv.H. Units CGS throughout.
+  //------------------------------------------------------------------
+
+  static constexpr amrex::Real fd_kRel = 1.0e-6;
+  static constexpr amrex::Real fd_kTFloor = 1.0;
+  static constexpr amrex::Real fd_kRhoFloor = 1.0e-8;
+  static constexpr amrex::Real fd_kYFloor = 1.0e-3;
+
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE static amrex::Real
+  fd_step(const amrex::Real x, const amrex::Real floor_val)
+  {
+    return fd_kRel * amrex::max(std::abs(x), floor_val);
+  }
+
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE static void fd_copyY(
+    const amrex::Real Yin[NUM_SPECIES], amrex::Real Yout[NUM_SPECIES])
+  {
+    for (int n = 0; n < NUM_SPECIES; ++n) {
+      Yout[n] = Yin[n];
+    }
+  }
+
+  // (dp/dT)_{rho,Y} — central difference on RTY2P
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real Calc_dpdT_num(
+    const amrex::Real R, const amrex::Real T, const amrex::Real Y[NUM_SPECIES])
+  {
+    const amrex::Real dT = fd_step(T, fd_kTFloor);
+    amrex::Real Pp = 0.0;
+    amrex::Real Pm = 0.0;
+    RTY2P(R, T + dT, Y, Pp);
+    RTY2P(R, T - dT, Y, Pm);
+    return (Pp - Pm) / (2.0 * dT);
+  }
+
+  // (dp/drho)_{T,Y} — central difference on RTY2P
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real Calc_dpdrho_num(
+    const amrex::Real R, const amrex::Real T, const amrex::Real Y[NUM_SPECIES])
+  {
+    const amrex::Real dr = fd_step(R, fd_kRhoFloor);
+    amrex::Real Pp = 0.0;
+    amrex::Real Pm = 0.0;
+    RTY2P(R + dr, T, Y, Pp);
+    RTY2P(R - dr, T, Y, Pm);
+    return (Pp - Pm) / (2.0 * dr);
+  }
+
+  // (dh/dT)_{rho,Y} — central difference on RTY2H
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real Calc_dhmdT_num(
+    const amrex::Real R, const amrex::Real T, const amrex::Real Y[NUM_SPECIES])
+  {
+    const amrex::Real dT = fd_step(T, fd_kTFloor);
+    amrex::Real hp = 0.0;
+    amrex::Real hm = 0.0;
+    RTY2H(R, T + dT, Y, hp);
+    RTY2H(R, T - dT, Y, hm);
+    return (hp - hm) / (2.0 * dT);
+  }
+
+  // (dh/drho)_{T,Y} — central difference on RTY2H
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real Calc_dhmdrho_num(
+    const amrex::Real R, const amrex::Real T, const amrex::Real Y[NUM_SPECIES])
+  {
+    const amrex::Real dr = fd_step(R, fd_kRhoFloor);
+    amrex::Real hp = 0.0;
+    amrex::Real hm = 0.0;
+    RTY2H(R + dr, T, Y, hp);
+    RTY2H(R - dr, T, Y, hm);
+    return (hp - hm) / (2.0 * dr);
+  }
+
+  // (dp/dY_k)_{rho,T,Y_{j!=k}} — central differences on RTY2P,
+  // all species
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE void Calc_dpdY_num(
+    const amrex::Real R,
+    const amrex::Real T,
+    const amrex::Real Y[NUM_SPECIES],
+    amrex::Real dPdY[NUM_SPECIES])
+  {
+    amrex::Real Yp[NUM_SPECIES];
+    amrex::Real Ym[NUM_SPECIES];
+    for (int k = 0; k < NUM_SPECIES; ++k) {
+      const amrex::Real dY = fd_step(Y[k], fd_kYFloor);
+      fd_copyY(Y, Yp);
+      fd_copyY(Y, Ym);
+      Yp[k] += dY;
+      Ym[k] -= dY;
+      amrex::Real Pp = 0.0;
+      amrex::Real Pm = 0.0;
+      RTY2P(R, T, Yp, Pp);
+      RTY2P(R, T, Ym, Pm);
+      dPdY[k] = (Pp - Pm) / (2.0 * dY);
+    }
+  }
+
+  // (dh/dY_k)_{rho,T,Y_{j!=k}} — central differences on RTY2H at
+  // FIXED density (matches Calc_dhmdY, i.e. the {tau,T} derivative),
+  // all species
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE void Calc_dhmdY_num(
+    const amrex::Real R,
+    const amrex::Real T,
+    const amrex::Real Y[NUM_SPECIES],
+    amrex::Real dhdY[NUM_SPECIES])
+  {
+    amrex::Real Yp[NUM_SPECIES];
+    amrex::Real Ym[NUM_SPECIES];
+    for (int k = 0; k < NUM_SPECIES; ++k) {
+      const amrex::Real dY = fd_step(Y[k], fd_kYFloor);
+      fd_copyY(Y, Yp);
+      fd_copyY(Y, Ym);
+      Yp[k] += dY;
+      Ym[k] -= dY;
+      amrex::Real hp = 0.0;
+      amrex::Real hm = 0.0;
+      RTY2H(R, T, Yp, hp);
+      RTY2H(R, T, Ym, hm);
+      dhdY[k] = (hp - hm) / (2.0 * dY);
+    }
+  }
+
+  // xi_k = (dh/dY_k)_{p,T,Y_{j!=k}} — central differences at FIXED
+  // pressure: density is re-solved with PYT2R after each Y kick,
+  // all species. Cross-check for the analytic combination
+  //   Calc_dhmdY[k] - (Calc_dhmdrho / Calc_dpdrho) * Calc_dpdY[k]
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE void Calc_xi_pT_num(
+    const amrex::Real R,
+    const amrex::Real T,
+    const amrex::Real Y[NUM_SPECIES],
+    amrex::Real xi[NUM_SPECIES])
+  {
+    amrex::Real P = 0.0;
+    RTY2P(R, T, Y, P);
+    amrex::Real Yp[NUM_SPECIES];
+    amrex::Real Ym[NUM_SPECIES];
+    for (int k = 0; k < NUM_SPECIES; ++k) {
+      const amrex::Real dY = fd_step(Y[k], fd_kYFloor);
+      fd_copyY(Y, Yp);
+      fd_copyY(Y, Ym);
+      Yp[k] += dY;
+      Ym[k] -= dY;
+      amrex::Real rhop = 0.0;
+      amrex::Real rhom = 0.0;
+      amrex::Real hp = 0.0;
+      amrex::Real hm = 0.0;
+      PYT2R(P, Yp, T, rhop);
+      PYT2R(P, Ym, T, rhom);
+      RTY2H(rhop, T, Yp, hp);
+      RTY2H(rhom, T, Ym, hm);
+      xi[k] = (hp - hm) / (2.0 * dY);
+    }
+  }
+
+  // D_ij = (d ln phi_i / d Y_j)_{T,p} — central differences at FIXED
+  // pressure. Cross-check for RTY2dlnphidY.
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE void RTY2dlnphidY_num(
+    const amrex::Real R,
+    const amrex::Real T,
+    const amrex::Real Y[NUM_SPECIES],
+    amrex::Real D[NUM_SPECIES][NUM_SPECIES])
+  {
+    amrex::Real P = 0.0;
+    RTY2P(R, T, Y, P);
+    amrex::Real Yp[NUM_SPECIES];
+    amrex::Real Ym[NUM_SPECIES];
+    amrex::Real lnphip[NUM_SPECIES];
+    amrex::Real lnphim[NUM_SPECIES];
+    for (int j = 0; j < NUM_SPECIES; ++j) {
+      const amrex::Real dY = fd_step(Y[j], fd_kYFloor);
+      fd_copyY(Y, Yp);
+      fd_copyY(Y, Ym);
+      Yp[j] += dY;
+      Ym[j] -= dY;
+      amrex::Real rhop = 0.0;
+      amrex::Real rhom = 0.0;
+      PYT2R(P, Yp, T, rhop);
+      PYT2R(P, Ym, T, rhom);
+      RTY2lnphi(rhop, T, Yp, lnphip);
+      RTY2lnphi(rhom, T, Ym, lnphim);
+      for (int i = 0; i < NUM_SPECIES; ++i) {
+        D[i][j] = (lnphip[i] - lnphim[i]) / (2.0 * dY);
+      }
+    }
+  }
 };
 } // namespace pele::physics::eos
 #endif
