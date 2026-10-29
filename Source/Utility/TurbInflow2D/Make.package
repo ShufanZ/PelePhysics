@@ -1,0 +1,5 @@
+CEXE_headers += turbinflow2D.H
+CEXE_sources += turbinflow2D.cpp
+
+VPATH_LOCATIONS += $(PELE_PHYSICS_HOME)/Source/Utility/TurbInflow2D
+INCLUDE_LOCATIONS += $(PELE_PHYSICS_HOME)/Source/Utility/TurbInflow2D

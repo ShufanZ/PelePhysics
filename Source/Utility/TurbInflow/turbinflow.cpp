@@ -1,5 +1,5 @@
 #include <turbinflow.H>
-
+#if AMREX_SPACEDIM == 3
 namespace pele::physics::turbinflow {
 void
 TurbInflow::init(amrex::Geometry const& /*geom*/)
@@ -522,3 +522,4 @@ TurbInflow::fill_turb_plane(
                              // early
 }
 } // namespace pele::physics::turbinflow
+#endif

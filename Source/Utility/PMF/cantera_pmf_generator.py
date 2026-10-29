@@ -14,7 +14,7 @@ import re
 
 import numpy as np
 import yaml
-from cantera import Solution, FreeFlame
+from cantera import Solution, CounterflowDiffusionFlame
 
 #################################################################
 # Parse arguments

@@ -5,7 +5,7 @@
 #include <AMReX_GpuMemory.H>
 #include <AMReX_Geometry.H>
 #include <AMReX_ParmParse.H>
-
+#if AMREX_SPACEDIM == 3
 namespace pele::physics::turbinflow {
 
 AMREX_ENUM(TurbInterpType, linear, quadratic);
@@ -106,4 +106,5 @@ private:
 };
 } // namespace pele::physics::turbinflow
 
+#endif
 #endif
