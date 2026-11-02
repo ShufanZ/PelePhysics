@@ -1,8 +1,4 @@
 #include <turbinflow.H>
-
-#if AMREX_SPACEDIM == 3
-
-
 #include <algorithm>
 
 namespace pele::physics::turbinflow {
@@ -912,4 +908,3 @@ TurbInflow::fill_turb_plane(
                              // early
 }
 } // namespace pele::physics::turbinflow
-#endif
