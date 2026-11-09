@@ -6,7 +6,6 @@
 #include <AMReX_Geometry.H>
 #include <AMReX_ParmParse.H>
 
-
 // Relative to this header so that a build which lists TurbInflow but not
 // Source/Utility/MeshMap among its include directories still compiles.
 #include "../MeshMap/MeshMapEvaluator.H"
