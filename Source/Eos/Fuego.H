@@ -522,6 +522,47 @@ struct Fuego
     dpdr_e = P / R;
   }
 
+  // (dp/dT)_{rho,Y}
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real Calc_dpdT(
+    const amrex::Real R, const amrex::Real T, const amrex::Real Y[NUM_SPECIES])
+  {
+    amrex::Real P = 0.0;	  
+    RTY2P(R, T, Y, P);
+    return P / T;
+  }
+
+  // (dp/drho)_{T,Y} = -tau^2 * (dp/dtau)_{T,Y}
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real Calc_dpdrho(
+    const amrex::Real R, const amrex::Real T, const amrex::Real Y[NUM_SPECIES])
+  {
+    amrex::Real P = 0.0;	  
+    RTY2P(R, T, Y, P);
+
+    return P / R;
+  }
+
+   // (dp/dY_k)_{rho,T,Y_{j!=k}} — all species
+  AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE void Calc_dpdY(
+    const amrex::Real R,
+    const amrex::Real T,
+    const amrex::Real Y[NUM_SPECIES],
+    amrex::Real dPdY[NUM_SPECIES])
+  {
+    for (int k = 0; k < NUM_SPECIES; ++k) {
+      dPdY[k] = Constants::RU * imw(k) * T * R;
+    }
+  }
+
+  //No fugacity for ideal gas
+  AMREX_GPU_HOST_DEVICE void RTY2dlnphidY(
+  const amrex::Real /*rho*/, 
+  const amrex::Real /*T*/,
+  const amrex::Real y[NUM_SPECIES], 
+  amrex::Real dlnphidY[NUM_SPECIES][NUM_SPECIES]
+) const
+ {
+ }
+
   template <class... Args>
   AMREX_GPU_HOST_DEVICE explicit Fuego(Args... /*unused*/)
   {
